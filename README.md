@@ -59,9 +59,10 @@ Aplikasi ini menggunakan **Cloudflare Custom API Token** dengan prinsip izin ter
 
 ## 🚀 Cara Menjalankan dari Source Code
 
-1. Buka PowerShell atau Command Prompt di folder proyek:
+1. Clone repositori ini atau buka PowerShell / Command Prompt di folder proyek:
    ```powershell
-   cd C:\Users\boy\Documents\CFMANAGER
+   git clone https://github.com/boysukapink/CF-MANAGER-RDR.git
+   cd CF-MANAGER-RDR
    ```
 2. Buat dan aktifkan virtual environment (opsional namun disarankan):
    ```powershell
