@@ -210,3 +210,72 @@ def test_bulk_purge_worker_execution(qapp, monkeypatch):
     assert worker.res["success"] == 1
     assert "r1" in deleted_ids
     assert "r2" not in deleted_ids
+
+
+def test_bulk_double_check_dialog_prevents_similar_domains(qapp):
+    from src.ui.bulk_dialog import BulkDoubleCheckDialog
+    from PySide6.QtWidgets import QCheckBox
+
+    items = [
+        {"source_hostname": "domainbaru.com", "destination_url": "https://target.com", "status_code": 301, "zone_id": "z1"},
+        {"source_hostname": "top-domainbaru.com", "destination_url": "https://target.com", "status_code": 301, "zone_id": "z2"},
+    ]
+    dlg = BulkDoubleCheckDialog(items)
+    assert dlg.table.rowCount() == 2
+
+    # Uncheck row 1 (top-domainbaru.com)
+    chk_top = dlg.table.cellWidget(1, 0)
+    assert isinstance(chk_top, QCheckBox)
+    chk_top.setChecked(False)
+
+    # Confirm
+    dlg._on_confirm()
+    assert len(dlg.confirmed_items) == 1
+    assert dlg.confirmed_items[0]["source_hostname"] == "domainbaru.com"
+    dlg.close()
+
+
+def test_bulk_result_dialog_shows_failed_domains(qapp):
+    from src.ui.bulk_dialog import BulkResultDialog
+
+    summary = {
+        "success": 1,
+        "failed": 2,
+        "errors": ["domainerror1.com: Missing DNS", "domainerror2.com: Zone not found"],
+        "failed_items": [
+            {"source": "domainerror1.com", "account_label": "CF 1", "error": "Missing DNS A/CNAME record"},
+            {"source": "domainerror2.com", "account_label": "CF 2", "error": "Zone not found"},
+        ],
+        "success_items": [
+            {"source": "domainsukses.com", "destination": "https://target.com"}
+        ]
+    }
+    dlg = BulkResultDialog(summary)
+    assert dlg.fail_table.rowCount() == 2
+    assert dlg.fail_table.item(0, 1).text() == "domainerror1.com"
+    assert "Missing DNS" in dlg.fail_table.item(0, 3).text()
+    assert dlg.fail_table.item(1, 1).text() == "domainerror2.com"
+    dlg.close()
+
+
+def test_bulk_tab1_exact_match_filter(qapp):
+    from src.cloudflare.zones import ZoneItem
+    from src.ui.bulk_dialog import BulkRedirectDialog
+
+    z1 = ZoneItem({"id": "z1", "name": "domainbaru.com", "status": "active"})
+    z2 = ZoneItem({"id": "z2", "name": "top-domainbaru.com", "status": "active"})
+    dlg = BulkRedirectDialog(zones=[z1, z2])
+
+    # Default substring filter: searching "domainbaru.com" matches both
+    dlg.tab1_exact_chk.setChecked(False)
+    dlg._filter_tab1_table("domainbaru.com")
+    assert dlg.tab1_table.isRowHidden(0) is False
+    assert dlg.tab1_table.isRowHidden(1) is False
+
+    # Exact match filter enabled: only matches "domainbaru.com" exactly!
+    dlg.tab1_exact_chk.setChecked(True)
+    dlg._filter_tab1_table("domainbaru.com")
+    assert dlg.tab1_table.isRowHidden(0) is False
+    assert dlg.tab1_table.isRowHidden(1) is True  # top-domainbaru.com is hidden!
+    dlg.close()
+

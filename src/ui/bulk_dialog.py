@@ -40,6 +40,388 @@ from src.security.validation import (
 from src.ui.workers import BulkCreateRedirectsWorker, BulkPurgeRedirectsWorker
 
 
+class BulkDoubleCheckDialog(QDialog):
+    """Modal dialog to double check all selected domains before executing bulk redirect.
+    Allows unchecking or filtering similar domains to prevent mistaken bulk actions.
+    """
+
+    def __init__(self, items: List[Dict[str, Any]], parent=None):
+        super().__init__(parent)
+        self.items = [dict(it) for it in items]
+        self.confirmed_items: List[Dict[str, Any]] = []
+
+        self.setWindowTitle("🔍 Double Check — Konfirmasi Daftar Domain Sebelum Redirect")
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            target_w = min(880, max(700, int(avail.width() * 0.85)))
+            target_h = min(580, max(440, int(avail.height() * 0.85)))
+            self.resize(target_w, target_h)
+        else:
+            self.resize(840, 520)
+        self.setMinimumSize(660, 400)
+        self.setStyleSheet("QDialog { background-color: #0F172A; border: 1px solid #1E293B; border-radius: 10px; }")
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        # Warning Card
+        warn_card = QFrame()
+        warn_card.setStyleSheet("background-color: #171E2E; border: 1px solid #F59E0B; border-radius: 8px; padding: 10px;")
+        warn_layout = QVBoxLayout(warn_card)
+        warn_layout.setContentsMargins(10, 8, 10, 8)
+        warn_layout.setSpacing(4)
+
+        warn_title = QLabel("⚠️ DOUBLE CHECK: Pastikan Domain Sudah Benar Sebelum Redirect")
+        warn_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #FBBF24;")
+        warn_layout.addWidget(warn_title)
+
+        warn_desc = QLabel(
+            "Periksa kembali setiap domain pada daftar di bawah. "
+            "Jika ada domain yang mirip dan tidak sengaja ikut terpilih (contoh: <code>top-domainbaru.com</code> vs <code>domainbaru.com</code>), "
+            "hilangkan tanda centang <b>[ ]</b> pada baris tersebut agar tidak dialihkan."
+        )
+        warn_desc.setTextFormat(Qt.TextFormat.RichText)
+        warn_desc.setStyleSheet("color: #E2E8F0; font-size: 11px;")
+        warn_desc.setWordWrap(True)
+        warn_layout.addWidget(warn_desc)
+        layout.addWidget(warn_card)
+
+        # Toolbar: Filter search & Counter
+        tool_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 Cari / filter cepat domain di daftar ini...")
+        self.search_input.textChanged.connect(self._filter_table)
+        tool_row.addWidget(self.search_input, stretch=2)
+
+        sel_all_btn = QPushButton("Pilih Semua")
+        sel_all_btn.setProperty("class", "btn-secondary")
+        sel_all_btn.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        sel_all_btn.clicked.connect(self._select_all)
+        tool_row.addWidget(sel_all_btn)
+
+        clr_all_btn = QPushButton("Kosongkan")
+        clr_all_btn.setProperty("class", "btn-secondary")
+        clr_all_btn.setStyleSheet("padding: 4px 10px; font-size: 11px;")
+        clr_all_btn.clicked.connect(self._clear_all)
+        tool_row.addWidget(clr_all_btn)
+
+        self.count_lbl = QLabel(f"{len(self.items)} domain dipilih")
+        self.count_lbl.setStyleSheet("color: #00F0FF; font-weight: 700; font-size: 12px; margin-left: 8px;")
+        tool_row.addWidget(self.count_lbl)
+        layout.addLayout(tool_row)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Pilih", "No", "Domain Sumber", "Akun CF", "URL Tujuan", "Status & Tipe"
+        ])
+        t_header = self.table.horizontalHeader()
+        t_header.setMinimumSectionSize(45)
+        t_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        t_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        t_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        t_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        t_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        t_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setColumnWidth(2, 210)
+        self.table.setColumnWidth(3, 140)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        layout.addWidget(self.table, stretch=1)
+
+        # Footer Actions
+        footer = QHBoxLayout()
+        self.cancel_btn = QPushButton("❌ Batal / Kembali ke Form")
+        self.cancel_btn.setProperty("class", "btn-secondary")
+        self.cancel_btn.clicked.connect(self.reject)
+        footer.addWidget(self.cancel_btn)
+
+        footer.addStretch()
+
+        self.confirm_btn = QPushButton(f"🚀 Konfirmasi & Terapkan Redirect ({len(self.items)} Domain)")
+        self.confirm_btn.setProperty("class", "btn-primary")
+        self.confirm_btn.setStyleSheet("font-weight: 700; font-size: 12px; padding: 8px 20px;")
+        self.confirm_btn.clicked.connect(self._on_confirm)
+        footer.addWidget(self.confirm_btn)
+
+        layout.addLayout(footer)
+
+        self._populate_table()
+
+    def _populate_table(self):
+        self.table.setRowCount(len(self.items))
+        mono_font = QFont("Consolas", 10)
+        mono_font.setBold(True)
+        small_mono = QFont("Consolas", 9)
+
+        for row, it in enumerate(self.items):
+            chk = QCheckBox()
+            chk.setChecked(True)
+            chk.setStyleSheet("margin-left: 6px;")
+            chk.toggled.connect(self._update_counts)
+            self.table.setCellWidget(row, 0, chk)
+
+            no_item = QTableWidgetItem(str(row + 1))
+            no_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            no_item.setForeground(QColor("#64748B"))
+            self.table.setItem(row, 1, no_item)
+
+            src = it.get("source_hostname", "")
+            src_item = QTableWidgetItem(src)
+            src_item.setFont(mono_font)
+            src_item.setForeground(QColor("#FFFFFF"))
+            self.table.setItem(row, 2, src_item)
+
+            acc_label = it.get("account_label", "") or "Akun CF"
+            acc_item = QTableWidgetItem(f"👤 {acc_label}")
+            acc_item.setFont(small_mono)
+            acc_item.setForeground(QColor("#38BDF8"))
+            self.table.setItem(row, 3, acc_item)
+
+            dest = it.get("destination_url", "")
+            dest_item = QTableWidgetItem(dest)
+            dest_item.setFont(small_mono)
+            dest_item.setForeground(QColor("#34D399"))
+            self.table.setItem(row, 4, dest_item)
+
+            code = it.get("status_code", 301)
+            stat_str = f"{code} Static"
+            stat_item = QTableWidgetItem(stat_str)
+            stat_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            stat_item.setFont(small_mono)
+            stat_item.setForeground(QColor("#38BDF8" if code == 301 else "#FB923C"))
+            self.table.setItem(row, 5, stat_item)
+
+        self._update_counts()
+
+    def _filter_table(self, text: str):
+        text = text.strip().lower()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 2)
+            if not text or (item and text in item.text().lower()):
+                self.table.setRowHidden(row, False)
+            else:
+                self.table.setRowHidden(row, True)
+
+    def _select_all(self):
+        for row in range(self.table.rowCount()):
+            if not self.table.isRowHidden(row):
+                chk = self.table.cellWidget(row, 0)
+                if isinstance(chk, QCheckBox):
+                    chk.setChecked(True)
+        self._update_counts()
+
+    def _clear_all(self):
+        for row in range(self.table.rowCount()):
+            if not self.table.isRowHidden(row):
+                chk = self.table.cellWidget(row, 0)
+                if isinstance(chk, QCheckBox):
+                    chk.setChecked(False)
+        self._update_counts()
+
+    def _update_counts(self):
+        checked_count = 0
+        for row in range(self.table.rowCount()):
+            chk = self.table.cellWidget(row, 0)
+            if isinstance(chk, QCheckBox) and chk.isChecked():
+                checked_count += 1
+        self.count_lbl.setText(f"{checked_count} dari {len(self.items)} domain dipilih")
+        self.confirm_btn.setEnabled(checked_count > 0)
+        self.confirm_btn.setText(f"🚀 Konfirmasi & Terapkan Redirect ({checked_count} Domain)")
+
+    def _on_confirm(self):
+        confirmed = []
+        for row in range(self.table.rowCount()):
+            chk = self.table.cellWidget(row, 0)
+            if isinstance(chk, QCheckBox) and chk.isChecked() and row < len(self.items):
+                confirmed.append(self.items[row])
+
+        if not confirmed:
+            QMessageBox.warning(self, "Peringatan", "Pilih minimal satu domain untuk dialihkan.")
+            return
+
+        self.confirmed_items = confirmed
+        self.accept()
+
+
+class BulkResultDialog(QDialog):
+    """Modal dialog displaying comprehensive bulk redirect results,
+    clearly identifying which domains failed, along with reasons and one-click copy.
+    """
+
+    def __init__(self, summary: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.summary = summary
+        self.success_count = summary.get("success", 0)
+        self.failed_count = summary.get("failed", 0)
+        self.failed_items = summary.get("failed_items", [])
+        self.success_items = summary.get("success_items", [])
+
+        title = "Hasil Bulk Redirect — Selesai" if self.failed_count == 0 else "Hasil Bulk Redirect — Ada Kendala"
+        self.setWindowTitle(title)
+        self.resize(780, 500)
+        self.setMinimumSize(660, 400)
+        self.setStyleSheet("QDialog { background-color: #0F172A; border: 1px solid #1E293B; border-radius: 10px; }")
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Header card
+        header_card = QFrame()
+        header_layout = QVBoxLayout(header_card)
+        header_layout.setContentsMargins(12, 10, 12, 10)
+        header_layout.setSpacing(4)
+
+        if self.failed_count == 0:
+            header_card.setStyleSheet("background-color: #0B291B; border: 1px solid #059669; border-radius: 8px;")
+            title_lbl = QLabel("🎉 Proses Bulk Redirect Berhasil Sempurna!")
+            title_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #34D399;")
+            desc_lbl = QLabel(f"Seluruh <b>{self.success_count}</b> domain berhasil dialihkan ke Cloudflare tanpa kendala.")
+            desc_lbl.setStyleSheet("color: #E2E8F0; font-size: 12px;")
+        else:
+            header_card.setStyleSheet("background-color: #2D1515; border: 1px solid #DC2626; border-radius: 8px;")
+            title_lbl = QLabel(f"⚠️ Proses Bulk Selesai dengan {self.failed_count} Domain Gagal")
+            title_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #F87171;")
+            desc_lbl = QLabel(
+                f"• Berhasil: <b style='color:#34D399;'>{self.success_count}</b> domain<br>"
+                f"• <b>GAGAL:</b> <b style='color:#F87171;'>{self.failed_count}</b> domain (Periksa rincian domain gagal di tabel bawah)"
+            )
+            desc_lbl.setStyleSheet("color: #E2E8F0; font-size: 12px;")
+
+        header_layout.addWidget(title_lbl)
+        header_layout.addWidget(desc_lbl)
+        layout.addWidget(header_card)
+
+        # If there are failed items, show failed domains table prominently
+        if self.failed_count > 0:
+            fail_title = QLabel("❌ Daftar Domain yang Gagal Diterapkan:")
+            fail_title.setStyleSheet("font-weight: 700; color: #F87171; font-size: 12px;")
+            layout.addWidget(fail_title)
+
+            self.fail_table = QTableWidget()
+            self.fail_table.setColumnCount(4)
+            self.fail_table.setHorizontalHeaderLabels([
+                "No", "Domain Gagal", "Akun CF", "Penyebab / Pesan Error dari Cloudflare"
+            ])
+            f_header = self.fail_table.horizontalHeader()
+            f_header.setMinimumSectionSize(50)
+            f_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            f_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            f_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+            f_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            self.fail_table.setColumnWidth(1, 190)
+            self.fail_table.setColumnWidth(2, 130)
+            self.fail_table.setRowCount(len(self.failed_items))
+
+            mono_font = QFont("Consolas", 9)
+            mono_font_bold = QFont("Consolas", 9)
+            mono_font_bold.setBold(True)
+
+            for row, item in enumerate(self.failed_items):
+                no_item = QTableWidgetItem(str(row + 1))
+                no_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                no_item.setForeground(QColor("#64748B"))
+                self.fail_table.setItem(row, 0, no_item)
+
+                src_item = QTableWidgetItem(item.get("source", "-"))
+                src_item.setFont(mono_font_bold)
+                src_item.setForeground(QColor("#F87171"))
+                self.fail_table.setItem(row, 1, src_item)
+
+                acc_label = item.get("account_label", "") or "Akun CF"
+                acc_item = QTableWidgetItem(f"👤 {acc_label}")
+                acc_item.setFont(mono_font)
+                acc_item.setForeground(QColor("#38BDF8"))
+                self.fail_table.setItem(row, 2, acc_item)
+
+                err_item = QTableWidgetItem(item.get("error", "Unknown error"))
+                err_item.setFont(mono_font)
+                err_item.setForeground(QColor("#FBBF24"))
+                self.fail_table.setItem(row, 3, err_item)
+
+            layout.addWidget(self.fail_table, stretch=1)
+
+            btn_row = QHBoxLayout()
+            copy_domains_btn = QPushButton("📋 Salin Nama Domain yang Gagal")
+            copy_domains_btn.setProperty("class", "btn-secondary")
+            copy_domains_btn.clicked.connect(self._copy_failed_domains)
+            btn_row.addWidget(copy_domains_btn)
+
+            copy_all_btn = QPushButton("📄 Salin Laporan Error Lengkap")
+            copy_all_btn.setProperty("class", "btn-secondary")
+            copy_all_btn.clicked.connect(self._copy_full_report)
+            btn_row.addWidget(copy_all_btn)
+
+            btn_row.addStretch()
+            layout.addLayout(btn_row)
+
+        else:
+            # All success: show success items list
+            succ_title = QLabel("✅ Daftar Domain yang Berhasil:")
+            succ_title.setStyleSheet("font-weight: 700; color: #34D399; font-size: 12px;")
+            layout.addWidget(succ_title)
+
+            self.succ_table = QTableWidget()
+            self.succ_table.setColumnCount(3)
+            self.succ_table.setHorizontalHeaderLabels(["No", "Domain Sumber", "URL Tujuan"])
+            s_header = self.succ_table.horizontalHeader()
+            s_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            s_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            s_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            self.succ_table.setColumnWidth(1, 200)
+            self.succ_table.setRowCount(len(self.success_items))
+
+            mono_font = QFont("Consolas", 9)
+            for row, item in enumerate(self.success_items):
+                no_item = QTableWidgetItem(str(row + 1))
+                no_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                no_item.setForeground(QColor("#64748B"))
+                self.succ_table.setItem(row, 0, no_item)
+
+                src_item = QTableWidgetItem(item.get("source", "-"))
+                src_item.setFont(mono_font)
+                src_item.setForeground(QColor("#FFFFFF"))
+                self.succ_table.setItem(row, 1, src_item)
+
+                dest_item = QTableWidgetItem(item.get("destination", "-"))
+                dest_item.setFont(mono_font)
+                dest_item.setForeground(QColor("#34D399"))
+                self.succ_table.setItem(row, 2, dest_item)
+
+            layout.addWidget(self.succ_table, stretch=1)
+
+        # Footer
+        footer = QHBoxLayout()
+        footer.addStretch()
+        close_btn = QPushButton("Tutup")
+        close_btn.setProperty("class", "btn-primary")
+        close_btn.setStyleSheet("padding: 6px 20px;")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+
+    def _copy_failed_domains(self):
+        text = "\n".join([it.get("source", "") for it in self.failed_items if it.get("source")])
+        if text:
+            QApplication.clipboard().setText(text)
+            QMessageBox.information(self, "Tersalin", f"Sebanyak {len(self.failed_items)} domain yang gagal telah disalin ke clipboard.")
+
+    def _copy_full_report(self):
+        lines = ["=== DAFTAR DOMAIN GAGAL DI-REDIRECT ==="]
+        for it in self.failed_items:
+            lines.append(f"Domain: {it.get('source')} | Akun: {it.get('account_label')} | Error: {it.get('error')}")
+        QApplication.clipboard().setText("\n".join(lines))
+        QMessageBox.information(self, "Tersalin", "Laporan error lengkap telah disalin ke clipboard.")
+
+
 class BulkRedirectDialog(QDialog):
     """Modern modal dialog for batch redirect creation across multiple Cloudflare zones."""
 
@@ -156,11 +538,22 @@ class BulkRedirectDialog(QDialog):
         left_title.setStyleSheet("font-weight: 700; color: #FFFFFF; font-size: 13px;")
         left_layout.addWidget(left_title)
 
-        # Search box
+        # Search box with Exact Match toggle
+        search_box_layout = QHBoxLayout()
         self.tab1_search = QLineEdit()
         self.tab1_search.setPlaceholderText("🔍 Cari domain...")
         self.tab1_search.textChanged.connect(self._filter_tab1_table)
-        left_layout.addWidget(self.tab1_search)
+        search_box_layout.addWidget(self.tab1_search, stretch=1)
+
+        self.tab1_exact_chk = QCheckBox("Exact Match")
+        self.tab1_exact_chk.setToolTip(
+            "Centang jika hanya ingin mencocokkan domain yang persis sama.\n"
+            "Contoh: jika mencari 'domainbaru.com', 'top-domainbaru.com' tidak akan ikut muncul."
+        )
+        self.tab1_exact_chk.setStyleSheet("color: #38BDF8; font-weight: 600; font-size: 11px;")
+        self.tab1_exact_chk.toggled.connect(lambda: self._filter_tab1_table(self.tab1_search.text()))
+        search_box_layout.addWidget(self.tab1_exact_chk)
+        left_layout.addLayout(search_box_layout)
 
         # Select all / Clear buttons
         sel_row = QHBoxLayout()
@@ -464,10 +857,18 @@ class BulkRedirectDialog(QDialog):
 
     def _filter_tab1_table(self, query: str):
         query = query.strip().lower()
+        exact = getattr(self, "tab1_exact_chk", None) and self.tab1_exact_chk.isChecked()
         for row in range(self.tab1_table.rowCount()):
             item = self.tab1_table.item(row, 1)
-            if not query or (item and query in item.text().lower()):
+            if not query:
                 self.tab1_table.setRowHidden(row, False)
+            elif item:
+                text = item.text().lower()
+                if exact:
+                    match = (text == query or text == f"www.{query}" or f"www.{text}" == query)
+                else:
+                    match = (query in text)
+                self.tab1_table.setRowHidden(row, not match)
             else:
                 self.tab1_table.setRowHidden(row, True)
 
@@ -489,7 +890,7 @@ class BulkRedirectDialog(QDialog):
     def _select_from_pasted_list(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("📋 Pilih Domain Berdasarkan Daftar Teks")
-        dlg.resize(480, 320)
+        dlg.resize(480, 340)
         vbox = QVBoxLayout(dlg)
         vbox.setContentsMargins(16, 16, 16, 16)
         vbox.setSpacing(10)
@@ -501,6 +902,11 @@ class BulkRedirectDialog(QDialog):
         txt = QTextEdit(dlg)
         txt.setPlaceholderText("domain1.com\ndomain2.com\n...")
         vbox.addWidget(txt)
+
+        clear_prev_chk = QCheckBox("Kosongkan centang sebelumnya terlebih dahulu (Hanya pilih dari daftar ini)", dlg)
+        clear_prev_chk.setChecked(True)
+        clear_prev_chk.setStyleSheet("color: #38BDF8; font-weight: 600; font-size: 11px;")
+        vbox.addWidget(clear_prev_chk)
 
         btn_row = QHBoxLayout()
         btn_cancel = QPushButton("Batal", dlg)
@@ -524,6 +930,13 @@ class BulkRedirectDialog(QDialog):
                     cleaned.add(t)
                     if t.startswith("www."):
                         cleaned.add(t[4:])
+
+            if clear_prev_chk.isChecked():
+                for row in range(self.tab1_table.rowCount()):
+                    chk = self.tab1_table.cellWidget(row, 0)
+                    if isinstance(chk, QCheckBox):
+                        chk.setChecked(False)
+
             matched_count = 0
             for row in range(self.tab1_table.rowCount()):
                 zone_name = self.zones[row].name.lower()
@@ -534,7 +947,7 @@ class BulkRedirectDialog(QDialog):
                         matched_count += 1
             self._update_tab1_count()
             dlg.accept()
-            QMessageBox.information(self, "Hasil Pemilihan", f"Berhasil mencentang {matched_count} domain yang cocok dari daftar.")
+            QMessageBox.information(self, "Hasil Pemilihan", f"Berhasil mencentang <b>{matched_count}</b> domain yang cocok dari daftar teks.")
 
         btn_ok.clicked.connect(on_apply)
         dlg.exec()
@@ -579,32 +992,13 @@ class BulkRedirectDialog(QDialog):
         preserve_q = self.tab1_preserve_query.isChecked()
         enabled = self.tab1_enabled_chk.isChecked()
 
-        confirm_msg = (
-            f"Anda akan menerapkan aturan ALL INCOMING Single Redirect ke <b>{len(selected_zones)}</b> domain:\n\n"
-            f"• URL Tujuan: {norm_dest}\n"
-            f"• Tipe URL: STATIC\n"
-            f"• Status Code: {status_code}\n"
-            f"• Cakupan: {coverage.upper()}\n"
-            f"• Preserve Query: {'ON' if preserve_q else 'OFF'}\n"
-            f"• Status Rule: {'Aktif' if enabled else 'Nonaktif'}\n\n"
-            f"Lanjutkan proses bulk?"
-        )
-        reply = QMessageBox.question(
-            self,
-            "Konfirmasi Bulk Redirect",
-            confirm_msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
         # Prepare batch payloads
         items_to_create = []
         for z in selected_zones:
             items_to_create.append({
                 "zone_id": z.id,
                 "account_id": z.account_id,
+                "account_label": getattr(z, "account_label", "") or "Akun CF",
                 "source_hostname": z.name,
                 "destination_url": norm_dest,
                 "coverage": coverage,
@@ -614,7 +1008,16 @@ class BulkRedirectDialog(QDialog):
                 "enabled": enabled,
             })
 
-        self._start_bulk_worker(items_to_create)
+        # Buka dialog Double Check untuk pratinjau dan konfirmasi daftar domain
+        check_dlg = BulkDoubleCheckDialog(items_to_create, parent=self)
+        if check_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        final_items = check_dlg.confirmed_items
+        if not final_items:
+            return
+
+        self._start_bulk_worker(final_items)
 
     def _auto_format_tab2_text(self):
         target = self.tab2_default_dest.text().strip()
@@ -800,19 +1203,6 @@ class BulkRedirectDialog(QDialog):
         if not valid_items:
             return
 
-        confirm_msg = (
-            f"Terapkan <b>{len(valid_items)}</b> aturan redirect terverifikasi ke Cloudflare?"
-        )
-        reply = QMessageBox.question(
-            self,
-            "Konfirmasi Bulk Import",
-            confirm_msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
         preserve_p = self.tab2_preserve_path.isChecked()
         preserve_q = self.tab2_preserve_query.isChecked()
         items_to_create = []
@@ -820,6 +1210,7 @@ class BulkRedirectDialog(QDialog):
             items_to_create.append({
                 "zone_id": p["zone"].id,
                 "account_id": p["zone"].account_id,
+                "account_label": getattr(p["zone"], "account_label", "") or "Akun CF",
                 "source_hostname": p["source"],
                 "destination_url": p["destination"],
                 "coverage": "all",
@@ -829,7 +1220,16 @@ class BulkRedirectDialog(QDialog):
                 "enabled": True,
             })
 
-        self._start_bulk_worker(items_to_create)
+        # Buka dialog Double Check untuk memverifikasi daftar domain sebelum diterapkan
+        check_dlg = BulkDoubleCheckDialog(items_to_create, parent=self)
+        if check_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        final_items = check_dlg.confirmed_items
+        if not final_items:
+            return
+
+        self._start_bulk_worker(final_items)
 
     def _start_bulk_worker(self, items: List[Dict[str, Any]]):
         self.tabs.setEnabled(False)
@@ -854,22 +1254,17 @@ class BulkRedirectDialog(QDialog):
         self.close_btn.setEnabled(True)
         success_count = summary.get("success", 0)
         failed_count = summary.get("failed", 0)
-        errors = summary.get("errors", [])
 
         self.progress_bar.setValue(100)
         self.progress_lbl.setText(f"Selesai! {success_count} berhasil, {failed_count} gagal/dilewati.")
 
-        err_details = "\n".join(errors[:10])
-        if len(errors) > 10:
-            err_details += f"\n... dan {len(errors) - 10} lainnya."
+        # Tampilkan Dialog Hasil Rinci (menampilkan daftar domain yang gagal & rincian error)
+        result_dlg = BulkResultDialog(summary, parent=self)
+        result_dlg.exec()
 
-        msg = f"Proses Bulk Redirect selesai!\n\n• Berhasil: {success_count}\n• Gagal/Dilewati: {failed_count}"
-        if errors:
-            msg += f"\n\nRincian Kendala:\n{err_details}"
-
-        QMessageBox.information(self, "Bulk Selesai", msg)
         self.bulk_completed.emit(success_count)
-        self.accept()
+        if failed_count == 0:
+            self.accept()
 
     def _on_worker_error(self, err_msg: str):
         self.tabs.setEnabled(True)

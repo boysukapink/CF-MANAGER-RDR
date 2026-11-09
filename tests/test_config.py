@@ -9,7 +9,7 @@ from src.config import Settings
 def test_settings_defaults():
     s = Settings()
     assert s.APP_NAME == "FlareRedirect"
-    assert s.APP_VERSION == "1.0.0"
+    assert s.APP_VERSION == "1.1.0"
     assert s.APP_ENV in ("production", "development", "testing")
     assert s.CLOUDFLARE_API_BASE_URL == "https://api.cloudflare.com/client/v4"
     assert s.TIMEOUT_CONNECT == 10.0

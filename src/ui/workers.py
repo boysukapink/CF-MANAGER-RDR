@@ -282,10 +282,13 @@ class BulkCreateRedirectsWorker(QThread):
             success_count = 0
             failed_count = 0
             errors = []
+            failed_items = []
+            success_items = []
 
             for idx, item in enumerate(self.items, start=1):
                 zone_id = item["zone_id"]
                 account_id = item.get("account_id")
+                account_label = item.get("account_label", "")
                 source = item["source_hostname"]
                 dest = item["destination_url"]
                 cov = item.get("coverage", "all")
@@ -314,15 +317,32 @@ class BulkCreateRedirectsWorker(QThread):
                         enabled=enabled,
                     )
                     success_count += 1
+                    success_items.append({
+                        "source": source,
+                        "destination": dest,
+                        "account_label": account_label,
+                        "status_code": status_code,
+                    })
                 except Exception as exc:
                     failed_count += 1
-                    err_text = f"{source}: {sanitize_message(str(exc))}"
+                    clean_err = sanitize_message(str(exc))
+                    err_text = f"{source}: {clean_err}"
                     errors.append(err_text)
+                    failed_items.append({
+                        "source": source,
+                        "destination": dest,
+                        "account_label": account_label,
+                        "zone_id": zone_id,
+                        "error": clean_err,
+                        "status_code": status_code,
+                    })
 
             self.finished.emit({
                 "success": success_count,
                 "failed": failed_count,
                 "errors": errors,
+                "failed_items": failed_items,
+                "success_items": success_items,
             })
         except Exception as exc:
             self.error.emit(sanitize_message(str(exc)))
