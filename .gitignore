@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.env.local
+.venv/
+env/
+venv/
+ENV/
+
+# Build artifacts
+build/
+*.spec.bak
+
+# Testing & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
